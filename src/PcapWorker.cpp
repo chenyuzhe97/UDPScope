@@ -59,17 +59,22 @@ bool PcapWorker::extract_udp_payload(const u_char* data, size_t caplen, int link
 
 void PcapWorker::rx_loop() {
     char errbuf[PCAP_ERRBUF_SIZE] = {0};
-    pcap_t* handle = pcap_open_live(cfg_.ifname, cfg_.snaplen, cfg_.promisc ? 1 : 0, cfg_.timeout_ms, errbuf);
+    pcap_t* handle = pcap_create(cfg_.ifname, errbuf);
     if (!handle) {
-        emit errorOccurred(QString("pcap_open_live failed: %1").arg(errbuf));
+        emit errorOccurred(QString("pcap_create failed: %1").arg(errbuf));
         running_.store(false);
         return;
     }
-
+    pcap_set_snaplen(handle, cfg_.snaplen);
+    pcap_set_promisc(handle, cfg_.promisc ? 1 : 0);
+    pcap_set_timeout(handle, cfg_.timeout_ms);
 #ifdef pcap_set_immediate_mode
     pcap_set_immediate_mode(handle, 1);
-    pcap_activate(handle);
 #endif
+    if (pcap_activate(handle) < 0) {
+        emit errorOccurred(QString("pcap_activate failed: %1").arg(pcap_geterr(handle)));
+        pcap_close(handle); running_.store(false); return;
+    }
 
     bpf_program fp{};
     if (pcap_compile(handle, &fp, cfg_.bpf, 1, PCAP_NETMASK_UNKNOWN) < 0) {

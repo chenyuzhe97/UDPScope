@@ -4,6 +4,7 @@
 #include <pcap/pcap.h>
 #include <pcap/dlt.h>
 #include <QObject>
+#include <QtGlobal>
 #include "Core.hpp"
 
 struct CaptureConfig {
@@ -25,8 +26,8 @@ public slots:
     void stop();
 
 signals:
-    void frameAdvanced(uint64_t widx);
-    void statsUpdated(uint64_t framesRx, uint64_t framesDrop, uint64_t bytesRx);
+    void frameAdvanced(quint64 widx);
+    void statsUpdated(quint64 framesRx, quint64 framesDrop, quint64 bytesRx);
     void errorOccurred(QString msg);
 
 private:

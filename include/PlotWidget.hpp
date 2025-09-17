@@ -16,7 +16,8 @@ public:
     void setUseMeasuredFps(bool v) { useMeasuredFps_ = v; }
 
 public slots:
-    void onFrameAdvanced(uint64_t widx);
+    // 用 Qt 元类型：quint64
+    void onFrameAdvanced(quint64 widx);
 
 protected:
     void initializeGL() override;
@@ -24,12 +25,12 @@ protected:
 
 private:
     const DecodedFrameRing* ring_ = nullptr;
-    uint64_t widx_ = 0;
+    quint64 widx_ = 0;
     int ch_ = 0;
     int bins_ = 1200;
     double windowSec_ = 1.0;
     bool useMeasuredFps_ = true;
     double measuredFps_ = 20000.0; // 初始估计
     QElapsedTimer fpsTimer_;
-    uint64_t lastFrameCount_ = 0;
+    quint64 lastFrameCount_ = 0;
 };

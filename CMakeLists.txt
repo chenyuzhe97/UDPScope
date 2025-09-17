@@ -10,7 +10,7 @@ set(CMAKE_AUTOUIC ON)
 find_package(Qt6 REQUIRED COMPONENTS Widgets OpenGL OpenGLWidgets)
 
 # libpcap
-find_path(PCAP_INCLUDE_DIR pcap/pcap.h)
+find_path(PCAP_INCLUDE_DIR NAMES pcap/pcap.h pcap.h)
 find_library(PCAP_LIBRARY pcap)
 if (NOT PCAP_INCLUDE_DIR OR NOT PCAP_LIBRARY)
   message(FATAL_ERROR "libpcap not found")
@@ -38,5 +38,3 @@ target_link_libraries(UdpScopeQt PRIVATE
   ${PCAP_LIBRARY}
 )
 
-# 更高刷新与轻量绘制建议的优化（可选）
-add_compile_definitions(QT_NO_KEYWORDS)

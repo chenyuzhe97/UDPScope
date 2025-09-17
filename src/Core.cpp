@@ -1,4 +1,5 @@
 #include "Core.hpp"
+#include <QtGlobal>
 
 Envelope build_envelope(const DecodedFrameRing& ring,
                         uint64_t widx_snapshot,
