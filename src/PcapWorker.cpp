@@ -1,12 +1,23 @@
 #include "PcapWorker.hpp"
+
 #include <QString>
+#include <QtGlobal>
 #include <cstdio>
 #include <cstring>
+
+#include <pcap/pcap.h>
+#include <pcap/dlt.h>
+
+// ------------------------ Ctor / Dtor ------------------------
 
 PcapWorker::PcapWorker(DecodedFrameRing& ring, const CaptureConfig& cfg, RuntimeStats& stats)
 : ring_(ring), cfg_(cfg), stats_(stats) {}
 
-PcapWorker::~PcapWorker() { stop(); }
+PcapWorker::~PcapWorker() {
+    stop();
+}
+
+// ------------------------ Public slots ------------------------
 
 void PcapWorker::start() {
     if (running_.exchange(true)) return;
@@ -17,6 +28,8 @@ void PcapWorker::stop() {
     if (!running_.exchange(false)) return;
     if (rx_thread_.joinable()) rx_thread_.join();
 }
+
+// ------------------------ Helpers ------------------------
 
 bool PcapWorker::extract_udp_payload(const u_char* data, size_t caplen, int linktype,
                                      const u_char*& udp_payload, size_t& udp_payload_len) {
@@ -57,6 +70,8 @@ bool PcapWorker::extract_udp_payload(const u_char* data, size_t caplen, int link
     return true;
 }
 
+// ------------------------ RX loop ------------------------
+
 void PcapWorker::rx_loop() {
     char errbuf[PCAP_ERRBUF_SIZE] = {0};
     pcap_t* handle = pcap_create(cfg_.ifname, errbuf);
@@ -65,6 +80,7 @@ void PcapWorker::rx_loop() {
         running_.store(false);
         return;
     }
+
     pcap_set_snaplen(handle, cfg_.snaplen);
     pcap_set_promisc(handle, cfg_.promisc ? 1 : 0);
     pcap_set_timeout(handle, cfg_.timeout_ms);
@@ -73,43 +89,61 @@ void PcapWorker::rx_loop() {
 #endif
     if (pcap_activate(handle) < 0) {
         emit errorOccurred(QString("pcap_activate failed: %1").arg(pcap_geterr(handle)));
-        pcap_close(handle); running_.store(false); return;
+        pcap_close(handle);
+        running_.store(false);
+        return;
     }
 
     bpf_program fp{};
     if (pcap_compile(handle, &fp, cfg_.bpf, 1, PCAP_NETMASK_UNKNOWN) < 0) {
         emit errorOccurred(QString("pcap_compile failed: %1").arg(pcap_geterr(handle)));
-        pcap_close(handle); running_.store(false); return;
+        pcap_close(handle);
+        running_.store(false);
+        return;
     }
     if (pcap_setfilter(handle, &fp) < 0) {
         emit errorOccurred(QString("pcap_setfilter failed: %1").arg(pcap_geterr(handle)));
-        pcap_freecode(&fp); pcap_close(handle); running_.store(false); return;
+        pcap_freecode(&fp);
+        pcap_close(handle);
+        running_.store(false);
+        return;
     }
     pcap_freecode(&fp);
 
     int linktype = pcap_datalink(handle);
-    uint16_t samples[SAMPLES_PER_FRAME];
+    std::vector<uint16_t> samples(static_cast<size_t>(g_cfg.samples_per_frame));
 
     while (running_.load(std::memory_order_relaxed)) {
         pcap_pkthdr* hdr = nullptr; const u_char* pkt = nullptr;
         int rc = pcap_next_ex(handle, &hdr, &pkt);
         if (rc == 1) {
             stats_.bytes_rx += hdr->len;
+
             const u_char* udp_payload = nullptr; size_t udp_len = 0;
             if (!extract_udp_payload(pkt, hdr->caplen, linktype, udp_payload, udp_len)) {
                 stats_.frames_drop++; continue;
             }
-            if (udp_len != (size_t)FRAME_SIZE_BYTES) { stats_.frames_drop++; continue; }
+
+            if (static_cast<int>(udp_len) != g_cfg.frame_size_bytes) {
+                stats_.frames_drop++; continue;
+            }
 
             const uint8_t* frame = reinterpret_cast<const uint8_t*>(udp_payload);
-            const uint8_t* payload = frame + HEADER_BYTES;
-            unpack10bit_1024(payload, samples);
-            ring_.push_frame(samples);
-            stats_.frames_rx++; emit frameAdvanced(ring_.snapshot_write_index());
+            const uint8_t* payload = frame + g_cfg.header_bytes;
+
+            if (!unpack_payload(payload, samples.data())) {
+                stats_.frames_drop++; continue;
+            }
+
+            ring_.push_frame(samples.data());
+            stats_.frames_rx++;
+            emit frameAdvanced(static_cast<quint64>(ring_.snapshot_write_index()));
         } else if (rc == 0) {
-            continue; // timeout
+            // timeout
+            continue;
         } else {
-            break;    // error or break
+            // error or break
+            break;
         }
     }
 

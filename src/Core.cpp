@@ -1,5 +1,43 @@
 #include "Core.hpp"
-#include <QtGlobal>
+
+ParserConfig g_cfg{}; // 默认值即为原先的常量，可在运行时修改其字段
+
+// 专用：RAW10 (5 bytes -> 4 samples)
+static inline bool unpack10bit_block(const uint8_t* p, int groups, uint16_t* out) {
+    for (int g = 0, o = 0; g < groups; ++g) {
+        const uint8_t b0 = p[g*5 + 0];
+        const uint8_t b1 = p[g*5 + 1];
+        const uint8_t b2 = p[g*5 + 2];
+        const uint8_t b3 = p[g*5 + 3];
+        const uint8_t b4 = p[g*5 + 4];
+        out[o++] = static_cast<uint16_t>( b0 | ((b4 & 0x03) << 8) );
+        out[o++] = static_cast<uint16_t>( b1 | ((b4 & 0x0C) << 6) );
+        out[o++] = static_cast<uint16_t>( b2 | ((b4 & 0x30) << 4) );
+        out[o++] = static_cast<uint16_t>( b3 | ((b4 & 0xC0) << 2) );
+    }
+    return true;
+}
+
+bool unpack_payload(const uint8_t* payload, uint16_t* out) {
+    if (g_cfg.pack == PackMode::RAW10_PACKED) {
+        // 校验：payload_bytes 必须是 5 的倍数，且 groups*4 == samples_per_frame
+        if (g_cfg.payload_bytes % 5 != 0) return false;
+        const int groups = g_cfg.payload_bytes / 5;
+        if (groups * 4 != g_cfg.samples_per_frame) return false;
+        return unpack10bit_block(payload, groups, out);
+    }
+    else if (g_cfg.pack == PackMode::RAW16_LE) {
+        // 小端 16bit 按样本数直接解包
+        const int need_bytes = g_cfg.samples_per_frame * 2;
+        if (g_cfg.payload_bytes < need_bytes) return false;
+        for (int i = 0; i < g_cfg.samples_per_frame; ++i) {
+            out[i] = static_cast<uint16_t>(payload[2*i] | (payload[2*i + 1] << 8));
+        }
+        return true;
+    }
+    // TODO: RAW12/RAW14/MIPI 等模式可在此扩展
+    return false;
+}
 
 Envelope build_envelope(const DecodedFrameRing& ring,
                         uint64_t widx_snapshot,
