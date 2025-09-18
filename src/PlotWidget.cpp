@@ -1,282 +1,251 @@
 #include "PlotWidget.hpp"
+// 没有 DecodedFrameRing.hpp？这里临时从 MainWindow.hpp 把它“带进来”。
+// 若你项目里 DecodedFrameRing 的声明在别的头，请把这行改成那个头。
+#include "MainWindow.hpp"
+
 #include <QPainter>
-#include <QPen>
-#include <QBrush>
 #include <QPainterPath>
 #include <QMouseEvent>
-#include <QOpenGLContext>
-#include <algorithm>
+#include <QFontMetrics>
 #include <cmath>
+#include <algorithm>
 
-static inline double nice_step(double raw) {
-    double exp10 = std::pow(10.0, std::floor(std::log10(std::max(1e-12, raw))));
-    double frac  = raw / exp10;
-    double nice;
-    if (frac < 1.5)      nice = 1.0;
-    else if (frac < 3.5) nice = 2.0;
-    else if (frac < 7.5) nice = 5.0;
-    else                 nice = 10.0;
-    return nice * exp10;
+// --------- 构建 envelope：把环形缓冲按时间窗口聚合为 bins ---------
+EnvelopeQT PlotWidget::buildEnvelope() const {
+    EnvelopeQT env;
+    env.x.resize(bins_);
+    env.ymin.resize(bins_);
+    env.ymax.resize(bins_);
+    env.mean.resize(bins_);
+
+    if (!ring_) {
+        std::fill(env.ymin.begin(), env.ymin.end(), 0.0);
+        std::fill(env.ymax.begin(), env.ymax.end(), 0.0);
+        std::fill(env.mean.begin(), env.mean.end(), 0.0);
+        for (int i=0;i<bins_;++i)
+            env.x[i] = -windowSec_ + (windowSec_*(i+0.5)/bins_);
+        return env;
+    }
+
+    const quint64 widx = ring_->snapshot_write_index();
+    const quint64 framesAvail   = std::min<quint64>(widx, ring_->capacity());
+    const quint64 windowFrames  = (quint64)std::llround(std::max(1.0, windowSec_ * 20000.0)); // 估算 20k fps
+    const quint64 span          = std::min(framesAvail, std::max<quint64>(1, windowFrames));
+    const quint64 startAbs      = widx > span ? (widx - span) : 0;
+    const double  framesPerBin  = (double)span / std::max(1, bins_);
+
+    for (int b=0;b<bins_;++b) {
+        quint64 f0 = startAbs + (quint64)std::floor(b * framesPerBin);
+        quint64 f1 = startAbs + (quint64)std::floor((b+1) * framesPerBin);
+        if (f1 <= f0) f1 = f0 + 1;
+
+        double vmin = 1e300, vmax = -1e300, sum = 0.0;
+        int cnt = 0;
+        for (quint64 f=f0; f<f1; ++f) {
+            double v = (double)ring_->get_sample(f, ch_);
+            vmin = std::min(vmin, v);
+            vmax = std::max(vmax, v);
+            sum += v; ++cnt;
+        }
+        env.ymin[b] = (cnt? vmin : 0.0);
+        env.ymax[b] = (cnt? vmax : 0.0);
+        env.mean[b] = (cnt? sum/std::max(1,cnt) : 0.0);
+
+        env.x[b] = -windowSec_ + (b + 0.5) * (windowSec_ / std::max(1, bins_));
+    }
+    return env;
 }
 
-// 背景亮度判定
-static inline bool is_dark_bg(const QColor& c) {
-    auto ch = [](double u){ u/=255.0; return (u<=0.03928)?(u/12.92):std::pow((u+0.055)/1.055,2.4); };
-    double L = 0.2126*ch(c.red()) + 0.7152*ch(c.green()) + 0.0722*ch(c.blue());
-    return L < 0.5;
+// --------- 一阶 RC 高通（对 mean 的副本） ---------
+void PlotWidget::highPassRC(QVector<double>& y, double dt, double fc_hz) {
+    if (y.isEmpty() || fc_hz <= 0.0) return;
+    const double tau   = 1.0 / (2.0 * M_PI * fc_hz);
+    const double alpha = tau / (tau + dt);
+    double prevY = 0.0;
+    double prevX = y[0];
+    for (int i=1;i<y.size();++i) {
+        const double xi = y[i];
+        const double yi = alpha * (prevY + xi - prevX);
+        y[i] = yi;
+        prevY = yi;
+        prevX = xi;
+    }
+    y[0] = 0.0;
 }
 
-PlotWidget::PlotWidget(QWidget* parent) : QOpenGLWidget(parent) {
-    setMinimumHeight(240);
-    setAutoFillBackground(false);
-    setAttribute(Qt::WA_OpaquePaintEvent, true);
-    fpsTimer_.start();
+PlotWidget::PlotWidget(QWidget* parent)
+    : QOpenGLWidget(parent)
+{
+    setMinimumHeight(160);
+    setMouseTracking(true);
 }
 
 void PlotWidget::initializeGL() {
     initializeOpenGLFunctions();
-    glClearColor(bgColor_.redF(), bgColor_.greenF(), bgColor_.blueF(), 1.0f);
 }
 
-void PlotWidget::setBgColor(const QColor& c) {
-    bgColor_ = c;
-    if (context()) {
-        makeCurrent();
-        glClearColor(bgColor_.redF(), bgColor_.greenF(), bgColor_.blueF(), 1.0f);
-        doneCurrent();
-    }
+void PlotWidget::onFrameAdvanced(quint64) {
     update();
-}
-
-void PlotWidget::onFrameAdvanced(quint64 widx) {
-    double dt = fpsTimer_.elapsed() / 1000.0;
-    if (dt >= 0.3) {
-        quint64 delta = (widx > lastFrameCount_) ? (widx - lastFrameCount_) : 0;
-        double inst = delta / std::max(1e-6, dt);
-        measuredFps_ = 0.9 * measuredFps_ + 0.1 * inst;
-        lastFrameCount_ = widx;
-        fpsTimer_.restart();
-    }
-    widx_ = widx;
-    update();
-}
-
-// 画图例（按钮）
-void PlotWidget::drawLegend(QPainter& p) {
-    const int pad = 8, box = 14, gap = 6;
-    QRectF area = rect().adjusted(pad, pad, -pad, -pad);
-
-    QFont f = p.font(); f.setPointSizeF(std::max(9.0, f.pointSizeF())); p.setFont(f);
-    QFontMetrics fm(f);
-
-    const QString envText  = "Env";
-    const QString meanText = "Mean";
-
-    const int envW  = fm.horizontalAdvance(envText)  + box + 6;
-    const int meanW = fm.horizontalAdvance(meanText) + box + 6;
-    const int h = std::max(box, fm.height());
-
-    const QPoint topRight(area.right(), area.top());
-
-    // 布局：右上角  Mean | Env
-    legendRectEnv_  = QRectF(topRight.x() - envW,                 topRight.y(), envW,  h);
-    legendRectMean_ = QRectF(legendRectEnv_.left() - gap - meanW, topRight.y(), meanW, h);
-
-    auto drawItem = [&](const QRectF& r, const QString& text, bool on, const QColor& colorBox, bool asLine){
-        const bool dark = is_dark_bg(bgColor_);
-        QColor frame = dark ? QColor(200,200,200) : QColor(60,60,60);
-        // 白底把面板透明度降一点，避免看起来像“阴影条”
-        QColor panel = dark ? QColor(40,40,45,200) : QColor(240,240,240,160);
-
-        p.setPen(frame); p.setBrush(panel);
-        p.drawRect(r.adjusted(0,0,-1,-1));
-
-        QRectF boxRect(r.left()+2, r.center().y() - box/2.0, box, box);
-        if (asLine) {
-            p.setPen(QPen(colorBox, 3));
-            p.drawLine(QPointF(boxRect.left()+2, boxRect.center().y()),
-                       QPointF(boxRect.right()-2, boxRect.center().y()));
-        } else {
-            p.setPen(Qt::NoPen); p.setBrush(colorBox); p.drawRect(boxRect);
-        }
-
-        if (!on) {
-            p.setPen(QPen(QColor(180,80,80), 2));
-            p.drawLine(boxRect.topLeft(), boxRect.bottomRight());
-            p.drawLine(boxRect.bottomLeft(), boxRect.topRight());
-        }
-
-        p.setPen(frame);
-        p.drawText(QRectF(boxRect.right()+4, r.top(), r.width()-box-6, r.height()),
-                   Qt::AlignVCenter|Qt::AlignLeft, text);
-    };
-
-    QColor envBox  = envColor_; envBox.setAlpha(200);
-    QColor meanCol = is_dark_bg(bgColor_) ? envColor_.lighter(120) : envColor_.darker(160);
-    drawItem(legendRectMean_, meanText, showMean_,     meanCol, /*asLine=*/true);
-    drawItem(legendRectEnv_,  envText,  showEnvelope_, envBox,  /*asLine=*/false);
-}
-
-void PlotWidget::drawAxesAndGrid(QPainter& p, const QRectF& R, double tmin, double tmax, double ymin, double ymax) {
-    const bool dark = is_dark_bg(bgColor_);
-    QColor axisCol  = dark ? QColor(150,150,155) : QColor(40,40,45);
-    QColor gridCol  = dark ? QColor(90,90,100)   : QColor(160,160,170);
-    QColor textCol  = dark ? QColor(200,200,205) : QColor(30,30,35);
-
-    p.setPen(axisCol);
-    p.drawRect(R);
-
-    p.setRenderHint(QPainter::Antialiasing, false);
-    QPen gridPen(gridCol);
-    gridPen.setStyle(Qt::DashLine);
-    gridPen.setWidth(dark ? 1 : 2);
-
-    double xrange = tmax - tmin;
-    double xtick = nice_step(xrange / 6.0);
-    double x0 = std::ceil(tmin / xtick) * xtick;
-
-    double yrange = ymax - ymin;
-    if (yrange <= 0) { yrange = 1; ymax = ymin + 1; }
-    double ytick = nice_step(yrange / 5.0);
-    double y0 = std::ceil(ymin / ytick) * ytick;
-
-    auto X = [&](double t){ return R.left() + (t - tmin) / (tmax - tmin) * R.width(); };
-    auto Y = [&](double v){ return R.bottom() - (v - ymin) / (ymax - ymin) * R.height(); };
-
-    p.setPen(gridPen);
-    for (double x = x0; x <= tmax + 1e-9; x += xtick) p.drawLine(QPointF(X(x), R.top()), QPointF(X(x), R.bottom()));
-    for (double y = y0; y <= ymax + 1e-9; y += ytick) p.drawLine(QPointF(R.left(), Y(y)), QPointF(R.right(), Y(y)));
-
-    p.setPen(textCol);
-    QFont f = p.font(); f.setPointSizeF(std::max(9.0, f.pointSizeF())); p.setFont(f);
-
-    for (double x = x0; x <= tmax + 1e-9; x += xtick) {
-        double xx = X(x);
-        QString s = QString::number(x, 'f', (std::abs(xtick) >= 1.0) ? 0 : 2);
-        p.drawText(QRectF(xx-30, R.bottom()+2, 60, 14), Qt::AlignHCenter|Qt::AlignTop, s);
-    }
-    for (double y = y0; y <= ymax + 1e-9; y += ytick) {
-        double yy = Y(y);
-        QString s = QString::number(y, 'f', (ytick >= 1.0) ? 0 : 2);
-        p.drawText(QRectF(R.left()-48, yy-7, 44, 14), Qt::AlignRight|Qt::AlignVCenter, s);
-    }
-    p.drawText(QRectF(R.right()-60, R.bottom()+16, 60, 14), Qt::AlignRight|Qt::AlignVCenter, "t (s)");
-    p.drawText(QRectF(R.left()-48, R.top()-2, 44, 14), Qt::AlignRight|Qt::AlignTop, "value");
-}
-
-void PlotWidget::drawMeanCurve(QPainter& p, const Envelope& env,
-                               std::function<double(double)> X,
-                               std::function<double(double)> Y)
-{
-    if (!showMean_ || env.mean.empty()) return;
-
-    QPainterPath path;
-    path.moveTo(X(env.x.front()), Y(env.mean.front()));
-    for (int i = 1; i < bins_; ++i)
-        path.lineTo(X(env.x[i]), Y(env.mean[i]));
-
-    QColor line = is_dark_bg(bgColor_) ? envColor_.lighter(120) : envColor_.darker(160);
-    QPen pen(line);
-    pen.setWidth(2);
-    p.setRenderHint(QPainter::Antialiasing, true);
-    p.setPen(pen);
-    p.drawPath(path);
-    p.setRenderHint(QPainter::Antialiasing, false);
 }
 
 void PlotWidget::paintGL() {
-    glClear(GL_COLOR_BUFFER_BIT);
-
     QPainter p(this);
-    p.fillRect(rect(), bgColor_);
+    p.setRenderHint(QPainter::Antialiasing, true);
 
-    drawLegend(p);
+    // 背景
+    p.fillRect(rect(), bg_);
 
-    if (!ring_ || widx_==0) {
-        QColor textCol = is_dark_bg(bgColor_) ? QColor(230,230,230) : QColor(30,30,30);
-        p.setPen(textCol);
-        p.drawText(rect(), Qt::AlignCenter, "waiting...");
+    // 边框
+    p.setPen(QPen(bg_.darker(140), 1));
+    p.drawRect(rect().adjusted(0,0,-1,-1));
+
+    // 绘图区（留出坐标和图例）
+    const QRectF plotR = rect().adjusted(40, 10, -10, -30);
+    if (plotR.width() <= 0 || plotR.height() <= 0) {
+        drawLegend(p);
         return;
     }
 
-    const double fps = useMeasuredFps_ ? std::max(1.0, measuredFps_) : 20000.0;
-    auto env = build_envelope(*ring_, widx_, ch_, fps, windowSec_, bins_);
+    // 数据
+    const auto env = buildEnvelope();
+    if (env.x.isEmpty()) { drawLegend(p); return; }
 
-    double ymin, ymax;
+    // X/Y 映射
+    const auto X = [&](double t) {
+        const double a = plotR.left();
+        const double b = plotR.right();
+        return a + (t + windowSec_) / windowSec_ * (b - a);
+    };
+    double ymin = yMin_, ymax = yMax_;
     if (autoY_) {
-        ymin = *std::min_element(env.ymin.begin(), env.ymin.end());
-        ymax = *std::max_element(env.ymax.begin(), env.ymax.end());
-        if (!(ymax > ymin)) { ymin = 0; ymax = g_cfg.max_sample(); }
-        double pad = (ymax - ymin) * 0.05; ymin -= pad; ymax += pad;
-    } else {
-        ymin = yUserMin_; ymax = yUserMax_;
-        if (!(ymax > ymin)) { ymin = 0; ymax = g_cfg.max_sample(); }
+        ymin =  1e300; ymax = -1e300;
+        for (int i=0;i<env.ymin.size();++i) {
+            ymin = std::min(ymin, env.ymin[i]);
+            ymax = std::max(ymax, env.ymax[i]);
+        }
+        if (ymax <= ymin) { ymin = 0; ymax = 1; }
+        const double pad = (ymax - ymin) * 0.05;
+        ymin -= pad; ymax += pad;
     }
+    const auto Y = [&](double v) {
+        return plotR.bottom() - (v - ymin) / (ymax - ymin) * plotR.height();
+    };
 
-    const double tmin = -windowSec_, tmax = 0.0;
-    QRectF R = rect().adjusted(56,24,-14,-26);
+    // 坐标轴
+    p.setPen(QPen(QColor(160,160,160), 1));
+    p.drawLine(QPointF(plotR.left(), plotR.bottom()), QPointF(plotR.right(), plotR.bottom())); // x
+    p.drawLine(QPointF(plotR.left(), plotR.top()),    QPointF(plotR.left(),  plotR.bottom())); // y
 
-    auto X = [&](double t){ return R.left() + (t - tmin) / (tmax - tmin) * R.width(); };
-    auto Y = [&](double v){ return R.bottom() - (v - ymin) / (ymax - ymin + 1e-9) * R.height(); };
+    // y 轴上下端刻度文字
+    p.setPen(QPen(QColor(180,180,180)));
+    p.drawText(QRectF(plotR.left()-38, plotR.top()-2, 36, 14), Qt::AlignRight|Qt::AlignVCenter, QString::number(ymax, 'f', 0));
+    p.drawText(QRectF(plotR.left()-38, plotR.bottom()-12, 36, 14), Qt::AlignRight|Qt::AlignVCenter, QString::number(ymin, 'f', 0));
 
-    // ---- 裁剪：后续所有绘制都限制在绘图区 R 内 ----
-    p.save();
-    p.setClipRect(R);
-
-    // 1) 包络阴影（无 Pen）+ 轮廓
+    // Envelope 阴影
     if (showEnvelope_) {
-        QPainterPath shaded;
-        // 先走 LOWER (左->右)
-        shaded.moveTo(X(env.x.front()), Y(env.ymin.front()));
-        for (int i = 1; i < bins_; ++i)
+        QPainterPath upper, lower;
+        upper.moveTo(X(env.x.front()), Y(env.ymax.front()));
+        lower.moveTo(X(env.x.front()), Y(env.ymin.front()));
+        for (int i=1;i<env.x.size();++i) {
+            upper.lineTo(X(env.x[i]), Y(env.ymax[i]));
+            lower.lineTo(X(env.x[i]), Y(env.ymin[i]));
+        }
+        QPainterPath shaded = upper;
+        for (int i=env.x.size()-1; i>=0; --i)
             shaded.lineTo(X(env.x[i]), Y(env.ymin[i]));
-        // 再走 UPPER (右->左)
-        for (int i = bins_ - 1; i >= 0; --i)
-            shaded.lineTo(X(env.x[i]), Y(env.ymax[i]));
-        shaded.closeSubpath();
-
         QColor fill = envColor_; fill.setAlpha(envAlpha_);
+        p.fillPath(shaded, fill);
 
-        QBrush br(fill);
-        QPen   noPen(Qt::NoPen);   // 关键：不画闭合边的描边
-        p.setPen(noPen);
-        p.setBrush(br);
-        p.drawPath(shaded);
-
-        if (drawOutlineEdges_) {
-            // 只画上沿（upper）
-            QPainterPath upper;
-            upper.moveTo(X(env.x.front()), Y(env.ymax.front()));
-            for (int i = 1; i < bins_; ++i)
-                upper.lineTo(X(env.x[i]), Y(env.ymax[i]));
-            QPen pen(is_dark_bg(bgColor_) ? envColor_.lighter(110) : envColor_.darker(130));
-            pen.setWidth(2);
-            p.setPen(pen);
-            p.setBrush(Qt::NoBrush);
+        if (drawOutline_) {
+            p.setPen(QPen(envColor_.lighter(110), 1));
             p.drawPath(upper);
+            p.drawPath(lower);
         }
     }
 
-    // 2) 网格/坐标
-    p.restore();          // 先恢复再画轴，不被裁剪掉轴框
-    drawAxesAndGrid(p, R, tmin, tmax, ymin, ymax);
+    // mean 曲线（青绿）
+    if (showMean_) {
+        QPainterPath m;
+        m.moveTo(X(env.x.front()), Y(env.mean.front()));
+        for (int i=1;i<env.x.size();++i) m.lineTo(X(env.x[i]), Y(env.mean[i]));
+        p.setPen(QPen(meanColor_, 1.8));
+        p.drawPath(m);
+    }
 
-    // 3) mean（再裁一次剪）
-    p.save();
-    p.setClipRect(R);
-    drawMeanCurve(p, env, X, Y);
-    p.restore();
+    // HPF(mean)（橙色）
+    if (showHPF_) {
+        QVector<double> yhp = env.mean; // 副本
+        const double dt_bin = windowSec_ / std::max(1, bins_);
+        highPassRC(yhp, dt_bin, hpfCutHz_);
+        QPainterPath h;
+        h.moveTo(X(env.x.front()), Y(yhp.front()));
+        for (int i=1;i<env.x.size();++i) h.lineTo(X(env.x[i]), Y(yhp[i]));
+        p.setPen(QPen(hpfColor_, 1.8));
+        p.drawPath(h);
+    }
 
-    // 4) 标题
-    QColor titleCol = is_dark_bg(bgColor_) ? QColor(200,200,205) : QColor(40,40,45);
-    p.setPen(titleCol);
-    p.drawText(QRectF(R.left(), R.top()-18, R.width(), 16), Qt::AlignLeft|Qt::AlignVCenter,
-               QString("Ch %1  |  span=%2 s  |  bins=%3").arg(ch_).arg(windowSec_).arg(bins_));
+    // 通道标题
+    p.setPen(QPen(QColor(200,200,200)));
+    p.drawText(QRectF(plotR.left(), rect().top()+2, plotR.width(), 14),
+               Qt::AlignLeft|Qt::AlignVCenter,
+               QString("Ch %1").arg(ch_));
+
+    drawLegend(p);
+}
+
+void PlotWidget::drawLegend(QPainter& p) {
+    legend_.clear();
+    const double pad = 6;
+    const double sw = 14; // 色块宽
+    const double sh = 12; // 色块高
+    double x = width() - 10;
+    double y = 8;
+
+    auto push = [&](const QString& name, const QColor& c, bool& flag) {
+        QFont f = p.font(); f.setPointSizeF(9); p.setFont(f);
+        const QFontMetrics fm(f);
+        const int tw = fm.horizontalAdvance(name) + 10;
+        x -= (sw + 4 + tw + pad);
+        QRectF r(x, y, sw+4+tw, sh+6);
+
+        // 背板（半透明）
+        p.setPen(Qt::NoPen);
+        QColor back(0,0,0,128);
+        p.fillRect(r, back);
+
+        // 颜色块（显示 on/off）
+        QColor box = flag ? c : QColor(130,130,130);
+        QRectF rc(x+3, y+3, sw, sh);
+        p.fillRect(rc, box);
+        p.setPen(QPen(QColor(230,230,230), 1));
+        p.drawRect(rc.adjusted(0,0,-1,-1));
+
+        // 文本
+        p.drawText(QRectF(x+sw+6, y, tw, sh+6), Qt::AlignVCenter|Qt::AlignLeft, name);
+
+        legend_.push_back({name, c, &flag, r});
+    };
+
+    // 顺序：Env / Mean / HPF
+    push("Env",  envColor_,  showEnvelope_);
+    push("Mean", meanColor_, showMean_);
+    push("HPF",  hpfColor_,  showHPF_);
+}
+
+int PlotWidget::hitLegendItem(const QPointF& pos) const {
+    for (int i=0;i<legend_.size();++i)
+        if (legend_[i].rect.contains(pos)) return i;
+    return -1;
 }
 
 void PlotWidget::mousePressEvent(QMouseEvent* e) {
-    const QPointF pt = e->position();
-    if (legendRectEnv_.contains(pt))  { showEnvelope_ = !showEnvelope_; update(); return; }
-    if (legendRectMean_.contains(pt)) { showMean_     = !showMean_;     update(); return; }
+    const int idx = hitLegendItem(e->position());
+    if (idx >= 0) {
+        if (legend_[idx].flag) {
+            *(legend_[idx].flag) = !*(legend_[idx].flag);
+            update();
+        }
+        return;
+    }
     QOpenGLWidget::mousePressEvent(e);
 }

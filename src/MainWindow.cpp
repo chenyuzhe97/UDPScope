@@ -99,6 +99,14 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     yMaxSpin_ = new QDoubleSpinBox(); yMaxSpin_->setRange(-1e9, 1e9); yMaxSpin_->setDecimals(2); yMaxSpin_->setValue(g_cfg.max_sample());
     yMinSpin_->setEnabled(false); yMaxSpin_->setEnabled(false);
 
+    // === HPF 截止频率控制 ===
+    auto* hpfCutSpin = new QDoubleSpinBox();
+    hpfCutSpin->setObjectName("hpfCutSpin");
+    hpfCutSpin->setRange(0.0, 200000.0);
+    hpfCutSpin->setDecimals(2);
+    hpfCutSpin->setSingleStep(10.0);
+    hpfCutSpin->setValue(50.0);
+
     rowView->addWidget(new QLabel("Channels (e.g. 0,1,5,10-20):"));
     rowView->addWidget(channelEdit_, 1);
     rowView->addWidget(new QLabel("Cols:")); rowView->addWidget(colsSpin_);
@@ -110,6 +118,11 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     rowView->addWidget(autoYCheck_);
     rowView->addWidget(new QLabel("Ymin:")); rowView->addWidget(yMinSpin_);
     rowView->addWidget(new QLabel("Ymax:")); rowView->addWidget(yMaxSpin_);
+
+    rowView->addSpacing(12);
+    rowView->addWidget(new QLabel("HPF Cut(Hz):"));
+    rowView->addWidget(hpfCutSpin);
+
     rowView->addWidget(applyViewBtn_);
     v->addLayout(rowView);
 
@@ -144,7 +157,11 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(yMinSpin_, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &MainWindow::onRebuildPlots);
     connect(yMaxSpin_, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &MainWindow::onRebuildPlots);
 
-    setWindowTitle("UDP Scope (Qt6 + pcap) — Axes + Adjustable Y + Theme");
+    // HPF 截止频率变化 -> 重建绘图
+    connect(hpfCutSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            this, &MainWindow::onRebuildPlots);
+
+    setWindowTitle("UDP Scope (Qt6 + pcap) — Axes + Adjustable Y + Theme + HPF");
     resize(1360, 900);
 }
 
@@ -279,16 +296,14 @@ void MainWindow::rebuildPlots() {
     double ymax    = yMaxSpin_->value();
     bool   outline = outlineCheck_->isChecked();
 
-    // White 主题时强制更清晰：降低填充、打开 Outline
+    // White 主题：仅轻度限制阴影透明度，**不再强制改动 Outline**
     if (isWhiteTheme) {
-        if (alpha > 25) alpha = 25;           // 阴影更淡
-        outline = true;                        // 打开上沿
-        outlineCheck_->blockSignals(true);
-        outlineCheck_->setChecked(true);
-        outlineCheck_->blockSignals(false);
-        alphaSpin_->blockSignals(true);
-        alphaSpin_->setValue(alpha);
-        alphaSpin_->blockSignals(false);
+        if (alpha > 25) {
+            alpha = 25;
+            alphaSpin_->blockSignals(true);
+            alphaSpin_->setValue(alpha);
+            alphaSpin_->blockSignals(false);
+        }
     }
 
     // 同步顶层与容器背景
@@ -306,6 +321,11 @@ void MainWindow::rebuildPlots() {
     };
     const QVector<QColor>& palette = isWhiteTheme ? paletteLight : paletteDark;
 
+    // 读取 HPF 截止频率
+    double hpfHz = 50.0;
+    if (auto* hpfSpin = central_->findChild<QDoubleSpinBox*>("hpfCutSpin"))
+        hpfHz = hpfSpin->value();
+
     for (int i = 0; i < chs.size(); ++i) {
         int r = i / cols, c = i % cols;
         auto* pw = new PlotWidget(plotsContainer_);
@@ -318,6 +338,9 @@ void MainWindow::rebuildPlots() {
         pw->setEnvColor(palette[i % palette.size()]);
         pw->setEnvAlpha(alpha);
         pw->setDrawOutline(outline);
+
+        // HPF 参数
+        pw->setHighPassCutHz(hpfHz);
 
         pw->setAutoY(autoY);
         if (!autoY) pw->setYRange(ymin, ymax);
