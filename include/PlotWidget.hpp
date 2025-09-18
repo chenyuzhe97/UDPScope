@@ -69,19 +69,22 @@ private:
     int     bins_{1200};
     double  windowSec_{1.0};
 
-    // 外观
-    QColor  bg_{QColor(26,26,30)};
-    QColor  envColor_{QColor(90,130,200)};
+    // 主题 & 样式
+    QColor  bg_{QColor(18,18,18)};
+    QColor  envColor_{QColor(100, 181, 246)}; // 蓝
     int     envAlpha_{70};
     bool    drawOutline_{false};
 
     // 纵轴
     bool    autoY_{true};
-    double  yMin_{0.0};
-    double  yMax_{1023.0};
+    double  yMin_{0};
+    double  yMax_{1023};
 
     // 图例状态
     bool    showEnvelope_{true};
+    bool    showRaw_{true};     // 新增：原始数据曲线
+    QColor  rawColor_{QColor(0, 200, 255)}; // 原始曲线颜色
+
     bool    showMean_{true};
     bool    showHPF_{false};     // 新增：高通曲线
     // 颜色：mean(青绿)、HPF(橙)

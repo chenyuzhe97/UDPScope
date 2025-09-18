@@ -62,22 +62,17 @@ void PlotWidget::highPassRC(QVector<double>& y, double dt, double fc_hz) {
     const double tau   = 1.0 / (2.0 * M_PI * fc_hz);
     const double alpha = tau / (tau + dt);
     double prevY = 0.0;
-    double prevX = y[0];
-    for (int i=1;i<y.size();++i) {
-        const double xi = y[i];
-        const double yi = alpha * (prevY + xi - prevX);
-        y[i] = yi;
-        prevY = yi;
-        prevX = xi;
+    for (int i=0;i<y.size();++i) {
+        const double x = y[i];
+        const double hp = alpha * (prevY + x - (i>0 ? y[i-1] : x));
+        prevY = x;
+        y[i] = hp;
     }
-    y[0] = 0.0;
 }
 
-PlotWidget::PlotWidget(QWidget* parent)
-    : QOpenGLWidget(parent)
-{
-    setMinimumHeight(160);
-    setMouseTracking(true);
+PlotWidget::PlotWidget(QWidget* parent) : QOpenGLWidget(parent) {
+    setMinimumHeight(120);
+    setAutoFillBackground(false);
 }
 
 void PlotWidget::initializeGL() {
@@ -99,12 +94,12 @@ void PlotWidget::paintGL() {
     p.setPen(QPen(bg_.darker(140), 1));
     p.drawRect(rect().adjusted(0,0,-1,-1));
 
-    // 绘图区（留出坐标和图例）
-    const QRectF plotR = rect().adjusted(40, 10, -10, -30);
-    if (plotR.width() <= 0 || plotR.height() <= 0) {
-        drawLegend(p);
-        return;
-    }
+    // 绘图区
+    const double lpad = 44, rpad = 8, tpad = 18, bpad = 18;
+    const QRectF plotR(rect().left()+lpad, rect().top()+tpad,
+                       rect().width()-lpad-rpad, rect().height()-tpad-bpad);
+
+    if (plotR.width() <= 1 || plotR.height() <= 1) { drawLegend(p); return; }
 
     // 数据
     const auto env = buildEnvelope();
@@ -141,6 +136,31 @@ void PlotWidget::paintGL() {
     p.drawText(QRectF(plotR.left()-38, plotR.top()-2, 36, 14), Qt::AlignRight|Qt::AlignVCenter, QString::number(ymax, 'f', 0));
     p.drawText(QRectF(plotR.left()-38, plotR.bottom()-12, 36, 14), Qt::AlignRight|Qt::AlignVCenter, QString::number(ymin, 'f', 0));
 
+    // Raw 原始数据曲线（按帧直接取该通道的样本）
+    if (showRaw_ && ring_) {
+        // 估算帧率与窗口帧数（与 buildEnvelope 保持一致）
+        const quint64 widx2 = ring_->snapshot_write_index();
+        const quint64 framesAvail2   = std::min<quint64>(widx2, ring_->capacity());
+        const quint64 windowFrames2  = (quint64)std::llround(std::max(1.0, windowSec_ * 20000.0)); // 假设 20k fps
+        const quint64 span2          = std::min(framesAvail2, std::max<quint64>(1, windowFrames2));
+        const quint64 startAbs2      = widx2 > span2 ? (widx2 - span2) : 0;
+
+        const int wpx = std::max(1, (int)std::floor(plotR.width()));
+        const quint64 stride = std::max<quint64>(1, span2 / std::max(1, wpx)); // 降采样：每像素取1点
+        QPainterPath rpath;
+        bool hasStart=false;
+        for (quint64 f = startAbs2; f < startAbs2 + span2; f += stride) {
+            double t = -windowSec_ + ((double)(f - startAbs2) + 0.5) / (double)span2 * windowSec_;
+            double v = (double)ring_->get_sample(f, ch_);
+            double xx = X(t);
+            double yy = Y(v);
+            if (!hasStart) { rpath.moveTo(xx, yy); hasStart=true; }
+            else           { rpath.lineTo(xx, yy); }
+        }
+        p.setPen(QPen(rawColor_, 1.2));
+        p.drawPath(rpath);
+    }
+
     // Envelope 阴影
     if (showEnvelope_) {
         QPainterPath upper, lower;
@@ -150,14 +170,13 @@ void PlotWidget::paintGL() {
             upper.lineTo(X(env.x[i]), Y(env.ymax[i]));
             lower.lineTo(X(env.x[i]), Y(env.ymin[i]));
         }
-        QPainterPath shaded = upper;
-        for (int i=env.x.size()-1; i>=0; --i)
-            shaded.lineTo(X(env.x[i]), Y(env.ymin[i]));
+        QPainterPath area = upper;
+        for (int i=env.x.size()-1;i>=0;--i) area.lineTo(X(env.x[i]), Y(env.ymin[i]));
         QColor fill = envColor_; fill.setAlpha(envAlpha_);
-        p.fillPath(shaded, fill);
+        p.fillPath(area, fill);
 
         if (drawOutline_) {
-            p.setPen(QPen(envColor_.lighter(110), 1));
+            p.setPen(QPen(envColor_.darker(110), 1.0));
             p.drawPath(upper);
             p.drawPath(lower);
         }
@@ -226,15 +245,17 @@ void PlotWidget::drawLegend(QPainter& p) {
         legend_.push_back({name, c, &flag, r});
     };
 
-    // 顺序：Env / Mean / HPF
+    // 顺序：Raw / Env / Mean / HPF
+    push("Raw",  rawColor_,  showRaw_);
     push("Env",  envColor_,  showEnvelope_);
     push("Mean", meanColor_, showMean_);
     push("HPF",  hpfColor_,  showHPF_);
 }
 
 int PlotWidget::hitLegendItem(const QPointF& pos) const {
-    for (int i=0;i<legend_.size();++i)
+    for (int i=0;i<legend_.size();++i) {
         if (legend_[i].rect.contains(pos)) return i;
+    }
     return -1;
 }
 
