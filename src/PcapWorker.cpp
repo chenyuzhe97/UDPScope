@@ -1,5 +1,5 @@
 #include "PcapWorker.hpp"
-
+#include <QtCore/QDebug>
 #include <QString>
 #include <QtGlobal>
 #include <cstdio>
@@ -7,6 +7,180 @@
 
 #include <pcap/pcap.h>
 #include <pcap/dlt.h>
+
+
+// ---- 工具：大端读取 ----
+static inline uint16_t be16(const u_char* p) {
+    return static_cast<uint16_t>((p[0] << 8) | p[1]);
+}
+static inline uint32_t be32(const u_char* p) {
+    return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
+}
+
+// ---- 打印各层长度（支持常见链路类型） ----
+// 返回是否成功解析（解析失败不会中断流程，只是不打印）
+static bool print_frame_lengths(const u_char* pkt, size_t caplen, int linktype) {
+    if (!pkt || caplen < 1) return false;
+
+    size_t link_len = 0;
+    uint16_t ether_type = 0;
+    const u_char* l3 = nullptr;            // 指向 IP 头
+    const u_char* l4 = nullptr;            // 指向 UDP/TCP 头
+    size_t l3_len = 0;                     // IP 头长度
+    size_t l4_len = 0;                     // UDP/TCP 头长度
+    size_t udp_payload_len = 0;
+    bool is_udp = false;
+
+    // ---- 解析 L2（链路层）----
+    switch (linktype) {
+    case DLT_EN10MB: { // 以太网
+        if (caplen < 14) return false;
+        link_len = 14;
+        ether_type = be16(pkt + 12);
+
+        // VLAN tag 0x8100/0x88a8：每个 tag 额外 4 字节
+        size_t off = 12;
+        while (ether_type == 0x8100 || ether_type == 0x88A8) {
+            if (caplen < link_len + 4) return false;
+            link_len += 4;
+            off += 4;
+            if (caplen < off + 2) return false;
+            ether_type = be16(pkt + off);
+        }
+
+        l3 = pkt + link_len;
+        break;
+    }
+    case DLT_LINUX_SLL: { // Linux cooked v1
+        if (caplen < 16) return false;
+        link_len = 16;
+        // proto 位于偏移 14-15
+        ether_type = be16(pkt + 14);
+        l3 = pkt + link_len;
+        break;
+    }
+    case DLT_LINUX_SLL2: { // Linux cooked v2
+        if (caplen < 20) return false;
+        link_len = 20;
+        // proto 位于偏移 16-17
+        ether_type = be16(pkt + 16);
+        l3 = pkt + link_len;
+        break;
+    }
+    case DLT_NULL: { // loopback/null
+        if (caplen < 4) return false;
+        link_len = 4;
+        // 这里不是以太类型，值平台相关；简单判断：0x00000002=AF_INET, 0x00000018=AF_INET6（BSD风格）
+        uint32_t af = *(const uint32_t*)pkt; // 本地字节序；不跨平台时够用
+        if (af == 2 /*AF_INET*/ || af == 0x02000000) ether_type = 0x0800;      // IPv4
+        else if (af == 24 /*AF_INET6*/ || af == 0x18000000) ether_type = 0x86DD; // IPv6
+        l3 = pkt + link_len;
+        break;
+    }
+    case DLT_RAW: { // 直接是 IP
+        link_len = 0;
+        l3 = pkt;
+        // 判断版本
+        if (caplen >= 1) {
+            uint8_t v = (l3[0] >> 4) & 0xF;
+            ether_type = (v == 4) ? 0x0800 : (v == 6) ? 0x86DD : 0;
+        }
+        break;
+    }
+    default:
+        // 未覆盖的链路类型：只打印总长
+        qDebug() << "[LEN] total=" << caplen << "(unsupported linktype=" << linktype << ")";
+        return false;
+    }
+
+    if (!l3 || size_t(l3 - pkt) > caplen) return false;
+    size_t remain = caplen - size_t(l3 - pkt);
+
+    // ---- 解析 L3（IPv4/IPv6）----
+    if (ether_type == 0x0800) { // IPv4
+        if (remain < 20) return false;
+        uint8_t ver_ihl = l3[0];
+        uint8_t ihl = (ver_ihl & 0x0F) * 4;
+        if (ihl < 20 || remain < ihl) return false;
+        l3_len = ihl;
+
+        uint8_t proto = l3[9];
+        const u_char* src = l3 + 12;
+        const u_char* dst = l3 + 16;
+
+        if (proto == 17 /*UDP*/) {
+            is_udp = true;
+            l4 = l3 + l3_len;
+            if ((caplen - size_t(l4 - pkt)) < 8) return false;
+            l4_len = 8;
+            uint16_t udp_len = be16(l4 + 4);
+            if (udp_len >= 8) udp_payload_len = udp_len - 8;
+        } else {
+            // 非 UDP：粗略给出 L4 头 0（这里你只关心 UDP，其他略过）
+        }
+
+        qDebug() << "[LEN]"
+                 << "total=" << caplen
+                 << "link=" << link_len
+                 << "ip=" << l3_len
+                 << "udp=" << (is_udp ? l4_len : 0)
+                 << "udp_payload=" << (is_udp ? udp_payload_len : 0)
+                 << "| IPv4"
+                 << "src=" << QString("%1.%2.%3.%4").arg(src[0]).arg(src[1]).arg(src[2]).arg(src[3])
+                 << "dst=" << QString("%1.%2.%3.%4").arg(dst[0]).arg(dst[1]).arg(dst[2]).arg(dst[3])
+                 << (is_udp ? QString("sport=%1 dport=%2")
+                                .arg(be16(l4)).arg(be16(l4 + 2))
+                            : QString("proto=%1").arg(proto));
+    }
+    else if (ether_type == 0x86DD) { // IPv6
+        if (remain < 40) return false;
+        l3_len = 40; // IPv6 固定头 40
+        uint8_t next = l3[6];
+        const u_char* src = l3 + 8;
+        const u_char* dst = l3 + 24;
+
+        // 只处理“无扩展头 + 直接 UDP”的常见情形
+        if (next == 17 /*UDP*/) {
+            is_udp = true;
+            l4 = l3 + l3_len;
+            if ((caplen - size_t(l4 - pkt)) < 8) return false;
+            l4_len = 8;
+            uint16_t udp_len = be16(l4 + 4);
+            if (udp_len >= 8) udp_payload_len = udp_len - 8;
+        }
+
+        auto ipv6_to_str = [](const u_char* p) {
+            // 简单十六进制展现，不做压缩：xxxx:xxxx:... 共8段
+            QStringList parts;
+            for (int i = 0; i < 16; i += 2) parts << QString("%1").arg(be16(p + i), 4, 16, QChar('0'));
+            return parts.join(":");
+        };
+
+        qDebug() << "[LEN]"
+                 << "total=" << caplen
+                 << "link=" << link_len
+                 << "ip=" << l3_len
+                 << "udp=" << (is_udp ? l4_len : 0)
+                 << "udp_payload=" << (is_udp ? udp_payload_len : 0)
+                 << "| IPv6"
+                 << "src=" << ipv6_to_str(src)
+                 << "dst=" << ipv6_to_str(dst)
+                 << (is_udp ? QString("sport=%1 dport=%2")
+                                .arg(be16(l4)).arg(be16(l4 + 2))
+                            : QString("next=%1").arg(next));
+    }
+    else {
+        // 其他 EtherType：不深究
+        qDebug() << "[LEN] total=" << caplen
+                 << "link=" << link_len
+                 << "ip=0 udp=0 udp_payload=0"
+                 << "etherType=0x" << QString::number(ether_type, 16);
+    }
+
+    return true;
+}
+
+
 
 // ------------------------ Ctor / Dtor ------------------------
 
@@ -124,6 +298,9 @@ void PcapWorker::rx_loop() {
                 stats_.frames_drop++; continue;
             }
 
+            (void)print_frame_lengths(pkt, hdr->caplen, linktype);
+
+
             if (static_cast<int>(udp_len) != g_cfg.frame_size_bytes) {
                 stats_.frames_drop++; continue;
             }
@@ -149,3 +326,4 @@ void PcapWorker::rx_loop() {
 
     pcap_close(handle);
 }
+
